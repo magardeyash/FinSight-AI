@@ -105,7 +105,7 @@ FinSight AI eliminates manual data entry and invoice auditing errors through aut
 1. `invoice_extractor` sends the extracted text to **Gemini 2.5 Flash** with instructions for structured JSON output adhering to the `ExtractedInvoice` Pydantic model.
 2. `validator` parses the output and runs deterministic validation checks:
    - **Math Consistency**: `subtotal + cgst + sgst + igst == grand_total` (tolerance: $\pm 0.05$).
-   - **Line Items**: $\sum (\text{quantity} \times \text{unit\_price}) \approx \text{subtotal}$.
+   - **Line Items**: $\sum (\text{quantity} \times \text{unit price}) \approx \text{subtotal}$.
    - **Date Chronology**: Verifies `due_date >= invoice_date`.
    - **Format Rules**: Verifies Indian GSTIN format via regex `^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]$`.
 3. If math or schema validation fails, the LangGraph state machine triggers a conditional retry loop back to `invoice_extractor` (up to 2 iterations), supplying the exact validation errors back to the model as feedback for self-correction.
