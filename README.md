@@ -1,357 +1,140 @@
 # FinSight AI — Agentic Financial Document Processing Platform
 
-[![Backend CI / Pytest](https://img.shields.io/badge/pytest-27%20passed-emerald.svg)](https://github.com)
-[![Python Version](https://img.shields.io/badge/python-3.11-blue.svg)](https://python.org)
-[![React Version](https://img.shields.io/badge/react-18-blue.svg)](https://react.dev)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688.svg)](https://fastapi.tiangolo.com)
-[![LangGraph](https://img.shields.io/badge/LangGraph-1.2+-purple.svg)](https://github.com/langchain-ai/langgraph)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
-**FinSight AI** is an enterprise-grade, agentic AI invoice processing and financial reconciliation platform designed for corporate finance and accounts payable (AP) teams.
-
-Unlike brittle rule engines or toy LLM wrappers, FinSight AI implements a robust **modular monolith** combining **FastAPI**, **LangGraph** with persistent MongoDB state checkpointing, **Google Gemini 2.5 Flash** for structured extraction, **Celery + Redis distributed locks** for idempotent background execution, and a responsive **React + TypeScript + Tailwind CSS** dashboard featuring a real-time Human-in-the-Loop (HITL) review queue.
+FinSight AI is a production-grade, agentic AI platform designed for automated invoice processing, financial reconciliation, and accounts payable (AP) workflows. It combines asynchronous task queuing, structured LLM extraction, deterministic financial validation, multi-layer fraud detection, and stateful Human-in-the-Loop (HITL) orchestration into a resilient modular monolith.
 
 ---
 
-## Architecture Overview
+## Complete Project Flow
 
-```
-                                  +---------------------------------------------+
-                                  |            React 18 + Vite SPA              |
-                                  |  (Dashboard, Review Queue, Invoice Viewer)  |
-                                  +---------------------------------------------+
-                                                         |
-                                                  HTTP / REST (JWT)
-                                                         v
-                                  +---------------------------------------------+
-                                  |            FastAPI API Gateway              |
-                                  |   (Auth, File Validation, Lifecycle REST)  |
-                                  +---------------------------------------------+
-                                        /                                 \
-                       Job Dispatch    /                                   \ Read / Resume
-                                      v                                     v
-                  +-----------------------+                         +---------------------+
-                  |   Redis 7 Task Broker |                         |  MongoDB Database   |
-                  |  + Distributed Locks  |                         |  - invoices         |
-                  +-----------------------+                         |  - users            |
-                              |                                     |  - audit_logs       |
-                              v                                     |  - checkpoints      |
-                  +-----------------------+                         +---------------------+
-                  | Celery Async Workers  |                                    ^
-                  +-----------------------+                                    |
-                              |                                                |
-                              +--------> Runs LangGraph State Machine ---------+
-```
-
-### The 9-Node LangGraph State Machine
+The following diagram illustrates the complete end-to-end lifecycle of a financial document—from initial browser upload to autonomous agentic verification, checkpointed human review, and persistent database finalization.
 
 ```mermaid
 flowchart TD
-    Start([Upload Invoice]) --> DL[1. document_loader]
-    DL --> TE[2. text_extractor]
-    TE --> IE[3. invoice_extractor\n(Gemini 2.5 Flash)]
-    IE --> V[4. validator\n(Deterministic Math & Schema)]
+    subgraph Client["1. Client Layer (React 18 + TypeScript)"]
+        UI["User Uploads Invoice PDF"]
+        HITL_UI["Reviewer Interface / Audit Log"]
+    end
+
+    subgraph Ingestion["2. Ingestion & Concurrency Control"]
+        API["FastAPI Gateway\n(JWT Auth + Tenant Isolation)"]
+        Lock["Redis 7 Distributed Lock\n(Key: finsight:lock:invoice:{id})"]
+        Queue["Celery Background Worker\n(Task Broker via Redis)"]
+    end
+
+    subgraph AgenticPipeline["3. LangGraph Stateful Agent Machine"]
+        DL["document_loader\n(Size & Page Validation)"]
+        TE["text_extractor\n(PyMuPDF Vector Extraction)"]
+        IE["invoice_extractor\n(Gemini 2.5 Flash + Pydantic Schema)"]
+        VAL["validator\n(Deterministic Decimal Math & GSTIN Regex)"]
+        DUP["duplicate_checker\n(SHA-256 Hash + Vendor/Inv Index)"]
+        RISK["risk_assessor\n(Additive Risk Scoring Engine)"]
+        
+        %% Conditional routing
+        HR["human_review\n(LangGraph interrupt: State Paused)"]
+        FIN["finalizer\n(Status: APPROVED / REJECTED)"]
+        ERR["error_handler\n(Status: FAILED)"]
+    end
+
+    subgraph Persistence["4. Persistence & Checkpointing"]
+        MongoState["MongoDB (MongoDBSaver)\n- Checkpoint Threads & States"]
+        MongoData["MongoDB Collections\n- invoices | users | audit_logs"]
+    end
+
+    %% Flow connections
+    UI -->|POST /api/v1/invoices/upload| API
+    API -->|Acquire Lock & Enqueue| Lock
+    Lock --> Queue
+    Queue --> DL
     
-    V -->|Validation Failed & Retries < 2| IE
-    V -->|Validated or Retries Exhausted| DC[5. duplicate_checker\n(SHA-256 + Vendor/Inv Key)]
+    DL -->|Valid PDF| TE
+    DL -.->|Corrupt / Over Limit| ERR
+    TE -->|Text Layer Present| IE
+    TE -.->|Scanned / Empty Text Error| ERR
     
-    DC --> RA[6. risk_assessor\n(Additive Risk Scoring)]
+    IE --> VAL
+    VAL -->|Math Mismatch & Retries < 2| IE
+    VAL -->|Validated or Retries Exhausted| DUP
+    DUP --> RISK
+
+    %% Risk Routing
+    RISK -->|Risk Score < 0.40 & Clean| FIN
+    RISK -->|Risk Score >= 0.40 or Duplicate| HR
+
+    %% Checkpoint and Interrupt
+    HR -.->|Persist Paused Thread| MongoState
+    HR -.->|Status: REVIEW_REQUIRED| MongoData
     
-    RA -->|Risk < 0.40 & No Errors| F[8. finalizer\n(Status: APPROVED)]
-    RA -->|Risk >= 0.40 or Duplicate| HR[7. human_review\n(interrupt: Paused)]
+    %% Human Interaction
+    HITL_UI <-->|Poll Pending Reviews & Stream PDF| MongoData
+    HITL_UI -->|POST /approve with Corrections| API
+    API -->|Command: resume| HR
     
-    HR -->|Command: Resume & Adjudicate| F
-    
-    DL -.->|File / Format Error| EH[9. error_handler\n(Status: FAILED)]
-    TE -.->|Scanned / Non-text Error| EH
-    
-    F --> End([Complete])
-    EH --> End
+    HR --> FIN
+    FIN -->|Persist Approved Document| MongoData
+    ERR -->|Persist Failure Reason| MongoData
 ```
 
 ---
 
-## Key Technical Highlights (Why This Architecture Stands Out)
+## 1. WHAT: System Capabilities & Core Modules
 
-1. **Stateful Agent Orchestration with LangGraph Checkpointing**:
-   - Rather than executing LLM calls in stateless loops, the pipeline uses a compiled `StateGraph` backed by `MongoDBSaver`.
-   - When an invoice triggers risk thresholds (e.g., GST calculation mismatches, duplicate vendor hashes, or low model confidence), the graph triggers `interrupt({"reason": ...})` and yields execution safely.
-   - When a human reviewer approves or submits corrections via the UI, the backend invokes `graph.invoke(Command(resume=corrections), config=...)`, resuming execution precisely at the paused checkpoint.
+FinSight AI eliminates manual data entry and invoice auditing errors through autonomous agentic workflows:
 
-2. **Strict Financial Calculations & Deterministic Validation**:
-   - LLMs can hallucinate math. FinSight AI never trusts LLM-calculated sums.
-   - A dedicated Python validator node verifies `subtotal + CGST + SGST + IGST == grand_total` using `Decimal` fixed-point arithmetic (avoiding IEEE 754 float rounding errors).
-   - Validates Indian GSTIN formats with exact state-code and checksum regular expressions (`^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]$`).
-
-3. **Production Idempotency & Distributed Locking**:
-   - Background tasks run in Celery workers protected by atomic Redis distributed locks (`finsight:lock:invoice:{id}`).
-   - Double-clicking upload or network retries will not spawn duplicate LLM calls or corrupt database states.
-   - Terminal states (`APPROVED`, `REJECTED`, `FAILED`) are enforced atomically in MongoDB using optimistic concurrency filters (`status: {"$in": ["PROCESSING", "REVIEW_REQUIRED"]}`).
-
-4. **Multi-Tenant Data Isolation**:
-   - Every invoice, duplicate search query, checkpoint, and audit log entry is partitioned by `user_id`.
-   - Cross-tenant data leakage is prevented at both the database query level and API middleware.
-
-5. **Pure Digital PDF Extraction (No Unreliable OCR Dependencies)**:
-   - Built with high-performance `PyMuPDF (fitz)` for direct vector and text-layer extraction.
-   - Unparseable, scanned, or image-only PDFs are intercepted early with clear user feedback rather than silently feeding garbage or empty tokens to Gemini.
+* **Asynchronous Document Processing**: Ingests multi-page invoices via non-blocking Celery workers, offloading compute-heavy parsing from the REST API.
+* **Structured Data Extraction**: Employs Google Gemini 2.5 Flash with Pydantic v2 schemas to convert unstructured invoice text into structured data (vendor details, buyer details, dates, currencies, line items, and tax totals).
+* **Deterministic Business Rule Validation**: Reconciles itemized sums against tax components and grand totals using cent-exact arithmetic without relying on LLM guesswork.
+* **Cryptographic & Semantic Duplicate Detection**: Identifies identical files using SHA-256 byte hashing, and identifies business duplicates using composite tenant-scoped vendor and invoice indices.
+* **Checkpointed Human-in-the-Loop Review**: Automatically halts the LangGraph workflow when high risk or discrepancies are flagged, persisting state to MongoDB and allowing reviewers to make inline corrections and resume execution.
+* **Immutable Audit Trail & Analytics**: Captures every state transition, LLM extraction round, human correction, and approval event in a queryable audit log.
 
 ---
 
-## Tech Stack
+## 2. HOW: Engineering Architecture & Execution Flow
 
-| Domain | Technology | Purpose |
-|---|---|---|
-| **Backend** | Python 3.11, FastAPI, Pydantic v2 | High-throughput asynchronous REST API |
-| **Agentic AI** | LangGraph 1.2+, Google Gemini 2.5 Flash | Structured JSON extraction & stateful HITL workflow |
-| **Database** | MongoDB 7.0, Motor, PyMongo | Document persistence & LangGraph checkpoint storage |
-| **Job Queue** | Celery 5.4, Redis 7 | Asynchronous document ingestion with distributed locking |
-| **Document Processing**| PyMuPDF (fitz) | Fast, deterministic digital PDF text extraction |
-| **Observability** | Langfuse v3 | Tracing model latency, token consumption, and errors |
-| **Frontend** | React 18, TypeScript, Vite, Tailwind CSS | Responsive, accessible finance analyst dashboard |
-| **UI Components** | Lucide React, Recharts | Interactive charts and status visualization |
-| **Containerization**| Docker, Docker Compose, Nginx | Multi-stage production container deployment |
+### A. Non-Blocking Ingestion & Idempotency
+1. The client uploads a digital PDF via the React interface.
+2. FastAPI validates the file extension and MIME type, writes the raw document to isolated storage, creates an initial record (`status: UPLOADED`), and enqueues a Celery task.
+3. The Celery worker acquires a Redis distributed lock (`finsight:lock:invoice:{id}`). If a duplicate task is dispatched or retried, the lock prevents concurrent processing.
 
----
+### B. Pure Digital Text Extraction
+1. `document_loader` validates that file size (≤ 20 MB) and page count (≤ 50 pages) remain within system thresholds.
+2. `text_extractor` executes via **PyMuPDF (`fitz`)**, reading raw character streams directly from the PDF DOM.
+3. If a document lacks extractable text (e.g., scanned image or empty PDF), the pipeline aborts immediately with a user-friendly error rather than wasting tokens on empty inputs.
 
-## Repository Structure
+### C. Agentic Extraction & Self-Correction Loop
+1. `invoice_extractor` sends the extracted text to **Gemini 2.5 Flash** with instructions for structured JSON output adhering to the `ExtractedInvoice` Pydantic model.
+2. `validator` parses the output and runs deterministic validation checks:
+   - **Math Consistency**: `subtotal + cgst + sgst + igst == grand_total` (tolerance: $\pm 0.05$).
+   - **Line Items**: $\sum (\text{quantity} \times \text{unit\_price}) \approx \text{subtotal}$.
+   - **Date Chronology**: Verifies `due_date >= invoice_date`.
+   - **Format Rules**: Verifies Indian GSTIN format via regex `^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z\d]Z[A-Z\d]$`.
+3. If math or schema validation fails, the LangGraph state machine triggers a conditional retry loop back to `invoice_extractor` (up to 2 iterations), supplying the exact validation errors back to the model as feedback for self-correction.
 
-```
-FinSight AI/
-├── .github/workflows/
-│   └── ci.yml                     # Automated GitHub Actions test & build pipeline
-├── backend/
-│   ├── app/
-│   │   ├── agents/                # LangGraph state machine & nodes
-│   │   │   ├── nodes/             # document_loader, text_extractor, invoice_extractor,
-│   │   │   │                      # validator, duplicate_checker, risk_assessor,
-│   │   │   │                      # human_review, finalizer, error_handler
-│   │   │   ├── prompts/           # Specialized extraction system prompts
-│   │   │   ├── checkpointer.py    # MongoDBSaver checkpoint integration
-│   │   │   ├── graph.py           # Compiled LangGraph workflow
-│   │   │   └── state.py           # TypedDict schema for pipeline state
-│   │   ├── auth/                  # JWT auth, bcrypt hashing, dependencies
-│   │   ├── dashboard/             # Aggregation pipelines for analytics
-│   │   ├── invoices/              # Invoice CRUD, file streaming, audit trails
-│   │   ├── schemas/               # Strict Pydantic models (Decimal, LineItems)
-│   │   ├── services/              # PDF processor, file storage, Langfuse client
-│   │   ├── utils/                 # Logging, HTTP exception handlers
-│   │   ├── workers/               # Celery app and distributed async tasks
-│   │   ├── config.py              # Pydantic Settings with production validation
-│   │   ├── database.py            # Event-loop-aware MongoDB client singleton
-│   │   └── main.py                # FastAPI application entrypoint
-│   ├── tests/                     # 27 comprehensive unit & integration tests
-│   ├── Dockerfile                 # Multi-stage Python 3.11 production image
-│   ├── pytest.ini                 # Pytest asyncio configuration
-│   └── requirements.txt           # Fully resolved, conflict-free dependencies
-├── frontend/
-│   ├── src/
-│   │   ├── api/                   # Axios client with auth interceptors
-│   │   ├── components/
-│   │   │   ├── invoice/           # StatusBadge, RiskBadge, UploadZone
-│   │   │   └── layout/            # Sidebar, AppShell navigation
-│   │   ├── pages/
-│   │   │   ├── auth/              # LoginPage, RegisterPage
-│   │   │   ├── DashboardPage.tsx  # KPI cards, Recharts pie chart, activity feed
-│   │   │   ├── InvoicesPage.tsx   # Search, status filters, paginated table
-│   │   │   ├── InvoiceDetailPage.tsx # Split view: PDF preview + field editor
-│   │   │   └── ReviewQueuePage.tsx   # Master-detail human review queue
-│   │   ├── stores/                # Zustand authStore with localStorage sync
-│   │   ├── types/                 # TypeScript interfaces
-│   │   ├── App.tsx                # React Router v6 protected routing
-│   │   └── main.tsx               # Entrypoint with TanStack Query provider
-│   ├── nginx.conf                 # Production Nginx reverse-proxy configuration
-│   └── Dockerfile                 # Multi-stage Node builder + Nginx alpine
-├── docker-compose.yml             # Full-stack composition (API, Worker, UI, Mongo, Redis)
-└── README.md
-```
+### D. Fraud Scoring & Stateful Interrupt
+1. `duplicate_checker` runs two checks within the user's tenant:
+   - Exact file hash match against existing SHA-256 hashes.
+   - Exact composite match on `(user_id, vendor_name, invoice_number)`.
+2. `risk_assessor` aggregates missing fields, validation failures, low extraction confidence, and duplicate flags into an additive risk score ($0.0 \to 1.0$).
+3. **Routing Decision**:
+   - **Low Risk ($< 0.40$) & No Errors**: Routes directly to `finalizer` (`status: APPROVED`).
+   - **High Risk ($\ge 0.40$) or Inconsistencies**: Enters `human_review`, which triggers LangGraph’s native `interrupt()`.
+4. Execution yields safely. The entire execution graph is serialized and persisted into MongoDB via `MongoDBSaver`.
+
+### E. Human Review & Workflow Resumption
+1. Flagged invoices appear in the React **Review Queue** with highlighted risk flags and discrepancies alongside an authenticated PDF viewer.
+2. The reviewer can edit fields directly in the UI.
+3. On clicking **Approve**, the backend invokes `graph.invoke(Command(resume=corrections), config={"configurable": {"thread_id": invoice_id}})`.
+4. LangGraph restores the exact execution state, updates fields with human overrides, recalculates totals, transitions the record to `APPROVED`, writes to the audit trail, and releases all resources.
 
 ---
 
-## Getting Started
+## 3. WHY: Key Architectural & Design Decisions
 
-### Prerequisites
-
-- **Docker & Docker Compose** (Recommended for full stack), OR:
-- **Python 3.11+**, **Node.js 20+**, **MongoDB 7+**, and **Redis 7+** installed locally.
-- A **Google Gemini API Key** ([Google AI Studio](https://aistudio.google.com/)).
-
----
-
-### Option 1: Run with Docker Compose (Fastest)
-
-1. **Clone the repository**:
-   ```bash
-   git clone https://github.com/your-username/finsight-ai.git
-   cd finsight-ai
-   ```
-
-2. **Configure Environment Variables**:
-   Copy the sample environment file:
-   ```bash
-   cp .env.example .env
-   ```
-   Edit `.env` and add your Gemini API key:
-   ```env
-   GOOGLE_API_KEY=your_actual_gemini_api_key
-   SECRET_KEY=generate_a_random_32_char_secret_key
-   ```
-
-3. **Start the Application**:
-   ```bash
-   docker compose up --build
-   ```
-
-4. **Access the Application**:
-   - **Web UI**: [http://localhost](http://localhost)
-   - **Backend API Docs (Swagger)**: [http://localhost:8000/docs](http://localhost:8000/docs)
-   - **API Health Check**: [http://localhost:8000/health](http://localhost:8000/health)
-
----
-
-### Option 2: Local Development Setup
-
-#### 1. Start MongoDB and Redis
-Using Docker for the database dependencies:
-```bash
-docker run -d --name mongo -p 27017:27017 mongo:7
-docker run -d --name redis -p 6379:6379 redis:7-alpine
-```
-
-#### 2. Backend Setup
-```bash
-cd backend
-
-# Create and activate Python 3.11 virtual environment
-python -m venv venv
-# On Windows:
-.\venv\Scripts\activate
-# On Linux/macOS:
-source venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Start FastAPI development server
-uvicorn app.main:app --reload --port 8000
-```
-
-In a separate terminal, start the **Celery worker**:
-```bash
-cd backend
-# On Windows (use gevent or solo pool for local dev):
-celery -A app.workers.celery_app worker --loglevel=info -P solo
-# On Linux/macOS:
-celery -A app.workers.celery_app worker --loglevel=info --concurrency=2
-```
-
-#### 3. Frontend Setup
-```bash
-cd frontend
-
-# Install packages
-npm install
-
-# Start Vite dev server
-npm run dev
-```
-Open [http://localhost:5173](http://localhost:5173) in your browser.
-
----
-
-## Running the Automated Test Suite
-
-The test suite covers schema validation, PDF extraction, GST business calculations, duplicate detection algorithms, JWT authentication, LangGraph state transitions, human review resumption, and API endpoints:
-
-```bash
-cd backend
-pytest -v --tb=short
-```
-
-Expected output:
-```
-tests/test_auth.py::test_user_registration_and_login PASSED              [  3%]
-tests/test_auth.py::test_protected_route_without_token PASSED            [  7%]
-tests/test_business_validation.py::test_business_validation_valid_invoice PASSED [ 11%]
-tests/test_business_validation.py::test_business_validation_detects_math_mismatch PASSED [ 14%]
-tests/test_business_validation.py::test_business_validation_detects_due_date_before_invoice_date PASSED [ 18%]
-tests/test_celery_idempotency.py::test_redis_distributed_locking_prevents_concurrent_runs PASSED [ 22%]
-tests/test_celery_idempotency.py::test_terminal_job_is_skipped PASSED    [ 25%]
-tests/test_duplicate_detection.py::test_duplicate_file_hash_detection PASSED [ 29%]
-tests/test_duplicate_detection.py::test_duplicate_vendor_invoice_number_detection PASSED [ 33%]
-tests/test_duplicate_detection.py::test_tenant_isolation_duplicate_checking PASSED [ 37%]
-tests/test_human_review.py::test_human_review_interrupt_and_resumption PASSED [ 40%]
-tests/test_invoice_schema.py::test_extracted_invoice_valid_gstin PASSED  [ 44%]
-tests/test_invoice_schema.py::test_extracted_invoice_invalid_gstin_returns_none PASSED [ 48%]
-tests/test_invoice_schema.py::test_decimal_precision_preservation PASSED [ 51%]
-tests/test_invoice_schema.py::test_line_item_validation PASSED           [ 55%]
-tests/test_invoice_schema.py::test_model_dump_json_compatibility PASSED  [ 59%]
-tests/test_invoices_api.py::test_invoice_upload_and_lifecycle_api PASSED [ 62%]
-tests/test_invoices_api.py::test_invoice_approval_and_rejection_api PASSED [ 66%]
-tests/test_invoices_api.py::test_dashboard_stats_and_activity_api PASSED [ 70%]
-tests/test_invoices_api.py::test_tenant_isolation_on_api PASSED          [ 74%]
-tests/test_langgraph_routing.py::test_routing_functions PASSED           [ 77%]
-tests/test_langgraph_routing.py::test_end_to_end_graph_auto_approval PASSED [ 81%]
-tests/test_pdf_extraction.py::test_extract_text_valid_pdf PASSED         [ 85%]
-tests/test_pdf_extraction.py::test_reject_empty_or_scanned_pdf PASSED    [ 88%]
-tests/test_pdf_extraction.py::test_file_not_found_handling PASSED        [ 92%]
-tests/test_status_transitions.py::test_atomic_status_transition_success PASSED [ 96%]
-tests/test_status_transitions.py::test_atomic_status_transition_prevents_duplicate_approval PASSED [100%]
-
-============================= 27 passed in 4.01s ==============================
-```
-
-To build and typecheck the frontend:
-```bash
-cd frontend
-npm run build
-```
-
----
-
-## API Reference (v1)
-
-### Authentication
-- `POST /api/v1/auth/register` — Register a new organization user.
-- `POST /api/v1/auth/login` — Authenticate and receive a Bearer JWT.
-- `GET /api/v1/auth/me` — Retrieve the currently authenticated user profile.
-
-### Invoice Processing
-- `POST /api/v1/invoices/upload` — Upload an invoice PDF (triggers background Celery task).
-- `GET /api/v1/invoices` — List invoices with pagination, status filters, and search.
-- `GET /api/v1/invoices/{id}` — Get invoice detail, risk breakdown, and line items.
-- `GET /api/v1/invoices/{id}/status` — Poll current workflow status and risk score.
-- `GET /api/v1/invoices/{id}/file` — Stream authenticated source PDF for preview.
-- `PATCH /api/v1/invoices/{id}` — Edit extracted fields prior to approval.
-- `POST /api/v1/invoices/{id}/approve` — Approve invoice and resume LangGraph workflow.
-- `POST /api/v1/invoices/{id}/reject` — Reject invoice with reviewer remarks.
-- `POST /api/v1/invoices/{id}/retry` — Re-queue a failed invoice execution.
-- `GET /api/v1/invoices/{id}/audit` — Retrieve immutable audit trail of workflow events.
-
-### Analytics & Dashboard
-- `GET /api/v1/dashboard/stats` — Total count, approved value, and pipeline status breakdown.
-- `GET /api/v1/dashboard/recent-activity` — Recent real-time audit feed across documents.
-
----
-
-## Placement & Interview Talking Points
-
-When discussing this project in engineering interviews:
-
-1. **Why LangGraph instead of a simple linear Python script?**
-   - *Answer:* Real document extraction is non-linear and stateful. We need conditional loops (retrying extraction with targeted hints if validation fails), deterministic branching, and checkpointing for human review. LangGraph provides durable persistence via `MongoDBSaver`, so a long-running graph can pause for hours waiting for human approval without holding memory or worker processes.
-
-2. **How did you handle Celery worker and FastAPI event loop conflicts with MongoDB?**
-   - *Answer:* Motor’s `AsyncIOMotorClient` binds to the event loop on creation. In Celery workers using `asgiref.sync.async_to_sync`, different tasks execute in different event loops, which triggers `RuntimeError: Event loop is closed`. I solved this by implementing a loop-aware client manager in `database.py` that tracks `asyncio.get_running_loop()` and provisions clean client instances per loop lifecycle.
-
-3. **Why Decimal instead of Float for invoice numbers?**
-   - *Answer:* Standard IEEE-754 floating-point numbers cannot accurately represent base-10 fractions (e.g. `0.1 + 0.2 != 0.3`). In financial systems, accumulating rounding errors results in audit failure. All tax and total calculations use `Decimal` with deterministic precision checks.
-
-4. **How is idempotency enforced?**
-   - *Answer:* Through a two-tiered defense: (1) Redis distributed locks prevent concurrent Celery tasks from operating on the same invoice ID, and (2) atomic MongoDB update operators with status preconditions (`status: {"$in": ["PROCESSING", "REVIEW_REQUIRED"]}`) prevent double approvals or race conditions.
-
----
-
-## License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+| Decision | Why It Was Chosen Over Alternatives |
+|---|---|
+| **LangGraph with `MongoDBSaver`** *(vs. Stateless Scripts / Linear Chains)* | Real document verification is non-linear and event-driven. Invoices can require multiple self-correction loops or remain in human review for days. LangGraph serializes execution state to MongoDB without holding open database transactions, blocking threads, or consuming worker memory while paused. |
+| **PyMuPDF (`fitz`)** *(vs. Tesseract / OCR Tools)* | 95%+ of modern B2B invoices are digitally exported PDFs containing native vector text layers. PyMuPDF extracts text in milliseconds without heavy external C++ binaries, CPU overhead, or OCR hallucination errors. Scanned documents are rejected at the gate. |
+| **Python `Decimal` Precision** *(vs. IEEE-754 Floats)* | Standard binary floating-point arithmetic introduces rounding inaccuracies (e.g., `0.1 + 0.2 != 0.3`). In financial software, fraction-of-a-cent errors lead to audit failure. All tax and reconciliation math is enforced using fixed-point `Decimal`. |
+| **Redis Distributed Locks** *(vs. In-Memory Locks)* | In distributed setups with multiple Celery worker nodes, memory locks fail. Redis keys with automatic expiration guarantee cluster-wide task idempotency, preventing duplicate billing or multiple LLM calls during network retries. |
+| **Loop-Aware Motor Client** *(vs. Naive Global Connection)* | Celery workers running asynchronous async-to-sync tasks spawn separate event loops across task executions. A naive global Motor client throws `RuntimeError: Event loop is closed`. Our loop-aware singleton binds client instances dynamically to the active running loop. |
+| **Modular Monolith** *(vs. Microservices)* | Avoids distributed transaction overhead, network latency, and orchestration complexity while maintaining clear boundary separation between domain services (agents, auth, ingestion, analytics). |
